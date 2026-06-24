@@ -137,6 +137,7 @@ def index_drives(drives, progress_cb=None):
     batch = []
     BATCH_SIZE = 2000
     total = 0
+    dir_sizes = {}  # Stocke la taille cumulée pour chaque répertoire
 
     def flush():
         nonlocal batch
@@ -148,6 +149,7 @@ def index_drives(drives, progress_cb=None):
             conn.commit()
             batch = []
 
+    # Première passe : indexer tous les fichiers et dossiers
     for drive in drives:
         INDEX_STATE["drive"] = drive
         for root, dirs, files in os.walk(drive, topdown=True, onerror=lambda e: None):
@@ -160,7 +162,9 @@ def index_drives(drives, progress_cb=None):
                     mt = int(os.path.getmtime(full))
                 except OSError:
                     mt = 0
+                # Initialiser la taille du dossier à 0 (sera calculée après)
                 batch.append((drive, full, d, d.lower(), "", 1, 0, mt, root))
+                dir_sizes[full] = 0
                 total += 1
             # Fichiers
             for f in files:
@@ -174,12 +178,22 @@ def index_drives(drives, progress_cb=None):
                     mt = 0
                 ext = os.path.splitext(f)[1].lstrip(".").lower()
                 batch.append((drive, full, f, f.lower(), ext, 0, sz, mt, root))
-                total += 1
+                # Ajouter la taille du fichier au dossier parent
+                parent_dir = root
+                while parent_dir and parent_dir in dir_sizes:
+                    dir_sizes[parent_dir] += sz
+                    parent_dir = os.path.dirname(parent_dir)
                 total += 1
             INDEX_STATE["count"] = total
             if len(batch) >= BATCH_SIZE:
                 flush()
     flush()
+
+    # Deuxième passe : mettre à jour les tailles des dossiers
+    for path, size in dir_sizes.items():
+        c.execute("UPDATE entries SET size = ? WHERE path = ? AND is_dir = 1", (size, path))
+    conn.commit()
+
     conn.close()
     INDEX_STATE.update(running=False, current="Terminé", count=total)
 
@@ -516,7 +530,7 @@ def search(q, use_regex, drives, include_subdirs, dirs_only, files_only,
     rows = rows[:1000]
     results = [{
         "path": r[0], "name": r[1], "is_dir": bool(r[2]),
-        "size": r[3], "size_h": human_size(r[3]) if not r[2] else "",
+        "size": r[3], "size_h": human_size(r[3]),
         "parent": r[4], "drive": r[5],
         "mtime": r[6] or 0,
     } for r in rows]
@@ -770,10 +784,34 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
 
+    <!-- Filtre rapide par date de modification -->
+    <div class="field" style="margin-bottom:12px">
+      <div class="field-label">📅 Filtrer par date de modification</div>
+      <div class="grid3">
+        <div class="field">
+          <input id="f-dmin-quick" type="text" placeholder="JJ/MM/AAAA (après)" title="Modifié après cette date"/>
+        </div>
+        <div class="field">
+          <input id="f-dmax-quick" type="text" placeholder="JJ/MM/AAAA (avant)" title="Modifié avant cette date"/>
+        </div>
+        <div class="field">
+          <select id="f-date-preset" style="padding:10px 14px;background:var(--input-bg);color:var(--text);
+                  border:1px solid var(--border);border-radius:8px;font-size:14px;width:100%">
+            <option value="">Prédéfini...</option>
+            <option value="today">Aujourd'hui</option>
+            <option value="yesterday">Hier</option>
+            <option value="week">7 derniers jours</option>
+            <option value="month">30 derniers jours</option>
+            <option value="year">12 derniers mois</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
     <!-- Options de base -->
     <div class="opts">
       <label><input type="checkbox" id="opt-sizes" checked> Afficher les tailles</label>
-      <label><input type="checkbox" id="opt-dates" checked> Afficher les dates</label>
+      <label><input type="checkbox" id="opt-mtime" checked> Afficher modifié le</label>
       <label><input type="checkbox" id="opt-dirs-only"> Dossiers uniquement</label>
       <label><input type="checkbox" id="opt-files-only"> Fichiers uniquement</label>
       <label><input type="checkbox" id="opt-subdirs" checked> Inclure les sous-répertoires</label>
@@ -942,7 +980,7 @@ document.getElementById('btn-reset').onclick = ()=>{
   document.getElementById('q').value='';
   document.getElementById('opt-regex').checked=false;
   document.getElementById('opt-sizes').checked=true;
-  document.getElementById('opt-dates').checked=true;
+  document.getElementById('opt-mtime').checked=true;
   document.getElementById('opt-dirs-only').checked=false;
   document.getElementById('opt-files-only').checked=false;
   document.getElementById('opt-subdirs').checked=true;
@@ -952,6 +990,9 @@ document.getElementById('btn-reset').onclick = ()=>{
   document.getElementById('f-path').value='';
   document.getElementById('f-dmin').value='';
   document.getElementById('f-dmax').value='';
+  document.getElementById('f-dmin-quick').value='';
+  document.getElementById('f-dmax-quick').value='';
+  document.getElementById('f-date-preset').value='';
   document.getElementById('f-sort').value='name';
   document.getElementById('regex-hint').style.display='none';
   document.getElementById('text-hint').style.display='block';
@@ -969,6 +1010,80 @@ document.getElementById('btn-reset').onclick = ()=>{
   SELECTED_SEARCH = new Set(DRIVES);
   document.querySelectorAll('#search-drives .sdrive-chip').forEach(b=>b.classList.add('on'));
 };
+
+// Synchronisation des champs de date rapide avec les champs avancés
+function syncDateFields(){
+  const dminQuick = document.getElementById('f-dmin-quick').value;
+  const dmaxQuick = document.getElementById('f-dmax-quick').value;
+  const dminAdv = document.getElementById('f-dmin').value;
+  const dmaxAdv = document.getElementById('f-dmax').value;
+  
+  // Si les champs rapides sont remplis, les copier vers les champs avancés
+  if(dminQuick || dmaxQuick){
+    if(!dminAdv) document.getElementById('f-dmin').value = dminQuick;
+    if(!dmaxAdv) document.getElementById('f-dmax').value = dmaxQuick;
+  }
+}
+
+// Gestion des prédéfini de date
+document.getElementById('f-date-preset').addEventListener('change', function(){
+  const preset = this.value;
+  const today = new Date();
+  const dmin = document.getElementById('f-dmin-quick');
+  const dmax = document.getElementById('f-dmax-quick');
+  
+  if(!preset) return;
+  
+  const pad = n => String(n).padStart(2,'0');
+  const todayStr = `${pad(today.getDate())}/${pad(today.getMonth()+1)}/${today.getFullYear()}`;
+  
+  switch(preset){
+    case 'today':
+      dmin.value = todayStr;
+      dmax.value = todayStr;
+      break;
+    case 'yesterday':
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      dmin.value = `${pad(yesterday.getDate())}/${pad(yesterday.getMonth()+1)}/${yesterday.getFullYear()}`;
+      dmax.value = `${pad(yesterday.getDate())}/${pad(yesterday.getMonth()+1)}/${yesterday.getFullYear()}`;
+      break;
+    case 'week':
+      const weekAgo = new Date(today);
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      dmin.value = `${pad(weekAgo.getDate())}/${pad(weekAgo.getMonth()+1)}/${weekAgo.getFullYear()}`;
+      dmax.value = todayStr;
+      break;
+    case 'month':
+      const monthAgo = new Date(today);
+      monthAgo.setDate(monthAgo.getDate() - 30);
+      dmin.value = `${pad(monthAgo.getDate())}/${pad(monthAgo.getMonth()+1)}/${monthAgo.getFullYear()}`;
+      dmax.value = todayStr;
+      break;
+    case 'year':
+      const yearAgo = new Date(today);
+      yearAgo.setDate(yearAgo.getDate() - 365);
+      dmin.value = `${pad(yearAgo.getDate())}/${pad(yearAgo.getMonth()+1)}/${yearAgo.getFullYear()}`;
+      dmax.value = todayStr;
+      break;
+  }
+  
+  // Réinitialiser le sélecteur
+  this.value = '';
+});
+
+// Synchroniser avant la recherche
+document.getElementById('btn-search').onclick = ()=>{
+  syncDateFields();
+  doSearch();
+};
+
+document.getElementById('q').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){
+    syncDateFields();
+    doSearch();
+  }
+});
 
 document.getElementById('btn-index').onclick = async ()=>{
   if(SELECTED_IDX.size===0){alert('Sélectionnez au moins un disque.');return;}
@@ -1009,7 +1124,7 @@ async function doSearch(){
   const r = await fetch('/api/search?'+params);
   const j = await r.json();
   const showSize = document.getElementById('opt-sizes').checked;
-  const showDate = document.getElementById('opt-dates').checked;
+  const showMtime = document.getElementById('opt-mtime').checked;
 
   if(j.error){
     document.getElementById('error-box').textContent='⚠ ' + j.error;
@@ -1023,6 +1138,17 @@ async function doSearch(){
   if(SELECTED_SEARCH.size < DRIVES.length)
     filterSummary.push(`disques: ${[...SELECTED_SEARCH].join(' ')}`);
   if(exts.length) filterSummary.push(`types: .${exts.join(' .')}`);
+  
+  // Ajouter le filtre par date si actif
+  const dmin = document.getElementById('f-dmin').value.trim();
+  const dmax = document.getElementById('f-dmax').value.trim();
+  if(dmin || dmax){
+    const dateFilter = [];
+    if(dmin) dateFilter.push(`après ${dmin}`);
+    if(dmax) dateFilter.push(`avant ${dmax}`);
+    filterSummary.push(`date: ${dateFilter.join(' et ')}`);
+  }
+  
   const summary = filterSummary.length ? ` [${filterSummary.join(' | ')}]` : '';
 
   document.getElementById('meta').textContent =
@@ -1036,14 +1162,14 @@ async function doSearch(){
   }
 
   // Avertissement si aucune date disponible (base indexée avant la mise à jour)
-  if(showDate && j.results.length > 0 && j.results.every(r => !r.mtime)){
+  if(showMtime && j.results.length > 0 && j.results.every(r => !r.mtime)){
     document.getElementById('meta').textContent +=
-      ' ⚠ Dates non disponibles — relancez une indexation.';
+      ' ⚠ Dates de modification non disponibles — relancez une indexation.';
   }
 
   const rows = j.results.map(it=>{
     const sz   = showSize ? `<td>${it.size_h}</td>` : '';
-    const dt   = showDate ? `<td style="white-space:nowrap;font-size:12px;color:var(--muted)">${fmtDate(it.mtime)}</td>` : '';
+    const dt   = showMtime ? `<td style="white-space:nowrap;font-size:12px;color:var(--muted)">${fmtDate(it.mtime)}</td>` : '';
     const tag  = it.is_dir ? '<span class="tag dir">DOSSIER</span>' : '<span class="tag file">FICHIER</span>';
     const openHref   = '/open?path='  +encodeURIComponent(it.path);
     const revealHref = '/reveal?path='+encodeURIComponent(it.path);
@@ -1057,7 +1183,7 @@ async function doSearch(){
   const szTh = showSize ? '<th>Taille</th>' : '';
   const currentSort = document.getElementById('f-sort').value;
   const dtArrow = currentSort === 'date_desc' ? ' ▼' : currentSort === 'date_asc' ? ' ▲' : '';
-  const dtTh = showDate
+  const dtTh = showMtime
     ? `<th style="cursor:pointer;user-select:none" title="Cliquer pour trier" onclick="cycleSort()">`
       + `Modifié le${dtArrow}</th>`
     : '';
@@ -1076,8 +1202,7 @@ function cycleSort(){
 
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
-document.getElementById('btn-search').onclick = doSearch;
-document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+
 
 // --- Thèmes ------------------------------------------------------------------
 const THEMES = ['default','slate','forest','bordeaux','light','sepia'];

@@ -28,11 +28,25 @@ import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
+# Import pour la surveillance en temps réel
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
+    print("⚠ watchdog non installé. La surveillance en temps réel ne sera pas disponible.")
+    print("  Installez-le avec : pip install watchdog")
+
 # --- Configuration -----------------------------------------------------------
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "DiskIndexer")
 os.makedirs(APP_DIR, exist_ok=True)
 DB_PATH = os.path.join(APP_DIR, "index.db")
 PORT = 8765
+
+# Variable globale pour stocker l'observateur watchdog actuel
+WATCHDOG_OBSERVER = None
+WATCHDOG_DRIVES = set()
 
 # Répertoires à ignorer (système / inaccessibles)
 SKIP_DIRS = {
@@ -40,6 +54,222 @@ SKIP_DIRS = {
     "Recovery", "Config.Msi", "ProgramData",
     "node_modules", ".git", "__pycache__",
 }
+
+# --- Surveillance en temps réel avec watchdog ------------------------------
+class DiskIndexerHandler(FileSystemEventHandler):
+    """Gestionnaire d'événements pour la surveillance en temps réel des fichiers."""
+    
+    def __init__(self, conn, skip_dirs=None):
+        self.conn = conn
+        self.skip_dirs = skip_dirs or set()
+        self.lock = threading.Lock()
+
+    def _should_ignore(self, path):
+        """Vérifie si un chemin doit être ignoré."""
+        for skip_dir in self.skip_dirs:
+            if skip_dir in path:
+                return True
+        return False
+
+    def on_created(self, event):
+        """Appelé lorsqu'un fichier ou dossier est créé."""
+        if self._should_ignore(event.src_path):
+            return
+        if not event.is_directory:
+            self._index_file(event.src_path)
+
+    def on_modified(self, event):
+        """Appelé lorsqu'un fichier ou dossier est modifié."""
+        if self._should_ignore(event.src_path):
+            return
+        if not event.is_directory:
+            self._index_file(event.src_path)
+
+    def on_deleted(self, event):
+        """Appelé lorsqu'un fichier ou dossier est supprimé."""
+        if self._should_ignore(event.src_path):
+            return
+        self._remove_file(event.src_path)
+
+    def on_moved(self, event):
+        """Appelé lorsqu'un fichier ou dossier est déplacé/renommé."""
+        if self._should_ignore(event.src_path) or self._should_ignore(event.dest_path):
+            return
+        self._remove_file(event.src_path)
+        if not event.is_directory:
+            self._index_file(event.dest_path)
+
+    def _index_file(self, path):
+        """Indexe un fichier individuel dans la base de données."""
+        try:
+            if os.name == "nt":
+                drive = os.path.splitdrive(path)[0] + "\\"
+            else:
+                drive = "/"
+            parent = os.path.dirname(path)
+            name = os.path.basename(path)
+            ext = os.path.splitext(name)[1].lstrip(".").lower()
+            
+            try:
+                st = os.stat(path)
+                sz = st.st_size
+                mt = int(st.st_mtime)
+            except OSError:
+                sz = 0
+                mt = 0
+            
+            name_lower = name.lower()
+
+            with self.lock:
+                c = self.conn.cursor()
+                c.execute("""
+                    INSERT OR REPLACE INTO entries
+                    (drive, path, name, name_lower, ext, is_dir, size, mtime, parent)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                """, (drive, path, name, name_lower, ext, sz, mt, parent))
+                self.conn.commit()
+        except Exception as e:
+            print(f"[Watchdog] Erreur lors de l'indexation de {path}: {e}")
+
+    def _remove_file(self, path):
+        """Supprime un fichier de l'index."""
+        try:
+            with self.lock:
+                c = self.conn.cursor()
+                c.execute("DELETE FROM entries WHERE path = ?", (path,))
+                self.conn.commit()
+        except Exception as e:
+            print(f"[Watchdog] Erreur lors de la suppression de {path}: {e}")
+
+
+# --- Fonction pour lancer l'observateur watchdog -----------------------------
+def start_watchdog_observer(drives, skip_dirs=None):
+    """
+    Lance un observateur watchdog pour surveiller les répertoires en temps réel.
+    
+    Args:
+        drives: Liste des répertoires à surveiller (ex: ['C:\\', 'D:\\'])
+        skip_dirs: Répertoires à ignorer (par défaut, SKIP_DIRS)
+    
+    Returns:
+        Observer: L'instance de l'observateur (ou None si watchdog n'est pas disponible)
+    """
+    global WATCHDOG_OBSERVER, WATCHDOG_DRIVES
+    
+    if not WATCHDOG_AVAILABLE:
+        return None
+    
+    # Arrêter l'observateur existant s'il y en a un
+    if WATCHDOG_OBSERVER:
+        WATCHDOG_OBSERVER.stop()
+        WATCHDOG_OBSERVER.join()
+    
+    conn = db_connect()
+    observer = Observer()
+    skip_dirs = skip_dirs or SKIP_DIRS
+    
+    # Répertoires à exclure de la surveillance (système, virtuels, etc.)
+    forbidden_dirs = {"/proc", "/sys", "/dev", "/run", "/boot"}
+    
+    for drive in drives:
+        if os.path.exists(drive):
+            # Sous Linux, éviter de surveiller la racine / ou les répertoires système
+            if os.name != "nt" and drive == "/":
+                print(f"[Watchdog] Ignore la racine / sous Linux (trop large)")
+                continue
+            
+            # Vérifier si le répertoire est dans les répertoires interdits
+            if any(forbidden in drive for forbidden in forbidden_dirs):
+                print(f"[Watchdog] Ignore {drive} (répertoire système)")
+                continue
+            
+            try:
+                handler = DiskIndexerHandler(conn, skip_dirs=skip_dirs)
+                observer.schedule(handler, drive, recursive=True)
+                print(f"[Watchdog] Surveillance activée pour : {drive}")
+                WATCHDOG_DRIVES.add(drive)
+            except Exception as e:
+                print(f"[Watchdog] Impossible de surveiller {drive}: {e}")
+    
+    if len(WATCHDOG_DRIVES) == 0:
+        print("[Watchdog] Aucun répertoire valide à surveiller")
+        return None
+    
+    observer.start()
+    WATCHDOG_OBSERVER = observer
+    return observer
+
+
+def start_watchdog_for_path(path, skip_dirs=None):
+    """
+    Lance la surveillance watchdog pour un répertoire spécifique.
+    
+    Args:
+        path: Chemin du répertoire à surveiller
+        skip_dirs: Répertoires à ignorer (par défaut, SKIP_DIRS)
+    
+    Returns:
+        bool: True si la surveillance a démarré, False sinon
+    """
+    global WATCHDOG_OBSERVER, WATCHDOG_DRIVES
+    
+    if not WATCHDOG_AVAILABLE:
+        return False
+    
+    # Normaliser le chemin
+    path = os.path.abspath(path)
+    
+    # Vérifier si le chemin existe et est un répertoire
+    if not os.path.isdir(path):
+        print(f"[Watchdog] {path} n'est pas un répertoire valide")
+        return False
+    
+    # Répertoires à exclure de la surveillance (système, virtuels, etc.)
+    forbidden_dirs = {"/proc", "/sys", "/dev", "/run", "/boot"}
+    
+    # Sous Linux, éviter de surveiller la racine / ou les répertoires système
+    if os.name != "nt" and path == "/":
+        print(f"[Watchdog] Ignore la racine / sous Linux (trop large)")
+        return False
+    
+    if any(forbidden in path for forbidden in forbidden_dirs):
+        print(f"[Watchdog] Ignore {path} (répertoire système)")
+        return False
+    
+    # Arrêter l'observateur existant s'il y en a un
+    stop_watchdog_observer()
+    
+    try:
+        conn = db_connect()
+        observer = Observer()
+        skip_dirs = skip_dirs or SKIP_DIRS
+        
+        handler = DiskIndexerHandler(conn, skip_dirs=skip_dirs)
+        observer.schedule(handler, path, recursive=True)
+        
+        observer.start()
+        WATCHDOG_OBSERVER = observer
+        WATCHDOG_DRIVES = {path}
+        
+        print(f"[Watchdog] Surveillance activée pour : {path}")
+        return True
+        
+    except Exception as e:
+        print(f"[Watchdog] Impossible de surveiller {path}: {e}")
+        return False
+
+
+def stop_watchdog_observer():
+    """Arrête l'observateur watchdog actuel."""
+    global WATCHDOG_OBSERVER, WATCHDOG_DRIVES
+    
+    if WATCHDOG_OBSERVER:
+        WATCHDOG_OBSERVER.stop()
+        WATCHDOG_OBSERVER.join()
+        WATCHDOG_OBSERVER = None
+        WATCHDOG_DRIVES.clear()
+        print("[Watchdog] Surveillance arrêtée")
+
 
 # --- Détection des disques (Windows) -----------------------------------------
 def list_drives():
@@ -716,6 +946,31 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 
+  <!-- Surveillance en temps réel -->
+  <section class="card">
+    <h3 style="margin-top:0">🔍 Surveillance en temps réel</h3>
+    <div class="field-label" style="margin-bottom:8px">
+      Sélectionnez un répertoire à surveiller avec watchdog
+      <span style="font-size:11px;color:var(--muted);margin-left:8px">
+        (Entrez manuellement le chemin ou utilisez le bouton "Parcourir" si votre navigateur le permet)
+      </span>
+    </div>
+    <div class="row" style="margin-bottom:12px; gap:8px">
+      <input type="text" id="watchdog-path" placeholder="Ex: C:\\MonDossier ou /home/user/Documents" 
+             style="flex:1; background:var(--input-bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 14px; font-size:14px">
+      <button id="btn-select-dir" class="secondary">Parcourir...</button>
+      <button id="btn-paste-path" class="secondary">Coller</button>
+    </div>
+    <div class="row" style="gap:8px">
+      <button id="btn-start-watchdog" disabled>Démarrer la surveillance</button>
+      <button id="btn-stop-watchdog" class="warn" disabled>Arrêter la surveillance</button>
+    </div>
+    <div class="status" id="watchdog-status" style="margin-top:12px">
+      Surveillance en temps réel : <span id="watchdog-state">inactive</span>
+    </div>
+    <div id="watchdog-drives-list" style="margin-top:8px; font-size:13px; color:var(--muted)"></div>
+  </section>
+
   <section class="card">
     <h3 style="margin-top:0">Recherche multi-critères</h3>
 
@@ -1234,6 +1489,192 @@ document.getElementById('btn-quit').onclick = async ()=>{
   document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:Segoe UI,sans-serif;color:#94a3b8;background:#0f172a"><div style="text-align:center"><div style="font-size:48px;margin-bottom:16px">⏻</div><div style="font-size:20px">DiskIndexer arrêté.</div><div style="font-size:14px;margin-top:8px">Vous pouvez fermer cet onglet.</div></div></div>';
 };
 
+// --- Surveillance en temps réel -------------------------------------------
+let WATCHDOG_SELECTED_PATH = null;
+
+// Mettre à jour l'interface de surveillance
+function updateWatchdogUI() {
+  const pathInput = document.getElementById('watchdog-path');
+  const startBtn = document.getElementById('btn-start-watchdog');
+  const stopBtn = document.getElementById('btn-stop-watchdog');
+  const stateEl = document.getElementById('watchdog-state');
+  const drivesListEl = document.getElementById('watchdog-drives-list');
+
+  // Mettre à jour le champ de chemin depuis l'input
+  const currentPath = pathInput.value.trim();
+  if (currentPath) {
+    WATCHDOG_SELECTED_PATH = currentPath;
+  }
+
+  // Vérifier l'état de la surveillance
+  fetch('/api/watchdog/status')
+    .then(r => r.json())
+    .then(data => {
+      const isRunning = data.running;
+      const drives = data.drives || [];
+      const available = data.available;
+
+      // Mettre à jour l'état
+      stateEl.textContent = isRunning ? 'active' : 'inactive';
+      stateEl.style.color = isRunning ? 'var(--success)' : 'var(--muted)';
+
+      // Mettre à jour la liste des répertoires surveillés
+      if (drives.length > 0) {
+        drivesListEl.textContent = 'Répertoires surveillés : ' + drives.join(', ');
+      } else {
+        drivesListEl.textContent = '';
+      }
+
+      // Gérer les boutons
+      stopBtn.disabled = !isRunning;
+      startBtn.disabled = !WATCHDOG_SELECTED_PATH || isRunning;
+
+      // Si la surveillance est active mais qu'aucun chemin n'est sélectionné,
+      // c'est que la surveillance a été démarrée automatiquement au démarrage
+      if (isRunning && !WATCHDOG_SELECTED_PATH && drives.length > 0) {
+        WATCHDOG_SELECTED_PATH = drives[0];
+        pathInput.value = WATCHDOG_SELECTED_PATH;
+      }
+
+      // Si la surveillance n'est pas disponible
+      if (!available) {
+        startBtn.disabled = true;
+        startBtn.title = 'watchdog non installé - installez-le avec : pip install watchdog';
+      } else {
+        startBtn.title = '';
+      }
+    })
+    .catch(() => {
+      stateEl.textContent = 'erreur';
+      stateEl.style.color = 'var(--error)';
+    });
+}
+
+// Sélectionner un répertoire (pour Electron ou navigateurs avec accès au système de fichiers)
+async function selectDirectory() {
+  // Essayer d'utiliser un input de type file avec webkitdirectory
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.webkitdirectory = true;
+    input.directory = true;
+    input.multiple = false;
+    input.style.display = 'none';
+    
+    input.addEventListener('change', async (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        const file = e.target.files[0];
+        
+        // Pour Electron ou navigateurs avec accès au système de fichiers
+        if (file.path) {
+          // Extraire le chemin du répertoire parent
+          let dirPath = file.path;
+          // Si c'est un fichier, obtenir le répertoire parent
+          if (file.path.includes('/') || file.path.includes('\\')) {
+            const lastSlash = Math.max(
+              file.path.lastIndexOf('/'),
+              file.path.lastIndexOf('\\')
+            );
+            dirPath = file.path.substring(0, lastSlash);
+          }
+          document.getElementById('watchdog-path').value = dirPath;
+          updateWatchdogUI();
+          document.body.removeChild(input);
+          resolve();
+          return;
+        }
+        
+        // Pour les navigateurs standards, on ne peut pas obtenir le chemin absolu
+        alert('Votre navigateur ne permet pas d\'obtenir le chemin absolu du répertoire.\n\n' +
+              'Veuillez entrer manuellement le chemin du répertoire dans le champ de texte.');
+      }
+      document.body.removeChild(input);
+      resolve();
+    });
+    
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+// Démarrer la surveillance
+async function startWatchdog() {
+  if (!WATCHDOG_SELECTED_PATH) {
+    alert('Veuillez d\'abord sélectionner un répertoire.');
+    return;
+  }
+
+  try {
+    const response = await fetch('/api/watchdog/start/path', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ path: WATCHDOG_SELECTED_PATH })
+    });
+
+    const data = await response.json();
+    
+    if (data.started) {
+      alert('Surveillance démarrée avec succès pour: ' + data.path);
+      updateWatchdogUI();
+    } else {
+      alert('Erreur: ' + (data.error || 'Impossible de démarrer la surveillance'));
+    }
+  } catch (error) {
+    console.error('Erreur:', error);
+    alert('Erreur lors du démarrage de la surveillance: ' + error.message);
+  }
+}
+
+// Arrêter la surveillance
+async function stopWatchdog() {
+  try {
+    const response = await fetch('/api/watchdog/stop', {
+      method: 'POST'
+    });
+
+    const data = await response.json();
+    
+    if (data.stopped) {
+      alert('Surveillance arrêtée');
+      updateWatchdogUI();
+    }
+  } catch (error) {
+    console.error('Erreur:', error);
+    alert('Erreur lors de l\'arrêt de la surveillance: ' + error.message);
+  }
+}
+
+// Initialiser les écouteurs d'événements
+document.getElementById('btn-select-dir').addEventListener('click', selectDirectory);
+document.getElementById('btn-start-watchdog').addEventListener('click', startWatchdog);
+document.getElementById('btn-stop-watchdog').addEventListener('click', stopWatchdog);
+document.getElementById('btn-paste-path').addEventListener('click', pastePath);
+document.getElementById('watchdog-path').addEventListener('input', updateWatchdogUI);
+
+// Coller le chemin depuis le presse-papiers
+async function pastePath() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) {
+      document.getElementById('watchdog-path').value = text;
+      updateWatchdogUI();
+    }
+  } catch (error) {
+    console.error('Impossible de coller:', error);
+    // Méthode alternative pour les navigateurs plus anciens
+    const text = prompt('Collez le chemin du répertoire ici:');
+    if (text) {
+      document.getElementById('watchdog-path').value = text;
+      updateWatchdogUI();
+    }
+  }
+}
+
+// Mettre à jour l'UI au chargement
+updateWatchdogUI();
+
 loadDrives(); refreshStatus();
 </script>
 </body></html>
@@ -1286,8 +1727,11 @@ class Handler(BaseHTTPRequestHandler):
                        date_min, date_max, sort_by)
             ))
         if u.path == "/api/shutdown":
-            # Arrêt propre : on coupe le serveur dans un thread séparé
-            threading.Thread(target=self.server_ref.shutdown, daemon=True).start()
+            # Arrêt propre : on coupe le serveur et l'observateur watchdog dans un thread séparé
+            def shutdown_all():
+                stop_watchdog_observer()
+                self.server_ref.shutdown()
+            threading.Thread(target=shutdown_all, daemon=True).start()
             return self._send(200, json.dumps({"bye": True}))
         if u.path == "/open":
             path = parse_qs(u.query).get("path", [""])[0]
@@ -1310,6 +1754,45 @@ class Handler(BaseHTTPRequestHandler):
             drives = data.get("drives") or list_drives()
             started = start_index_async(drives)
             return self._send(200, json.dumps({"started": started}))
+        if u.path == "/api/watchdog/start":
+            drives = data.get("drives") or list_drives()
+            if WATCHDOG_AVAILABLE:
+                observer = start_watchdog_observer(drives)
+                return self._send(200, json.dumps({
+                    "started": observer is not None,
+                    "drives": list(WATCHDOG_DRIVES)
+                }))
+            else:
+                return self._send(200, json.dumps({
+                    "started": False,
+                    "error": "watchdog non installé"
+                }))
+        if u.path == "/api/watchdog/start/path":
+            # Démarrer la surveillance pour un répertoire spécifique
+            path = data.get("path")
+            if not path:
+                return self._send(400, json.dumps({"error": "Aucun chemin spécifié"}))
+            if WATCHDOG_AVAILABLE:
+                success = start_watchdog_for_path(path)
+                return self._send(200, json.dumps({
+                    "started": success,
+                    "path": path if success else None,
+                    "drives": list(WATCHDOG_DRIVES) if success else []
+                }))
+            else:
+                return self._send(200, json.dumps({
+                    "started": False,
+                    "error": "watchdog non installé"
+                }))
+        if u.path == "/api/watchdog/stop":
+            stop_watchdog_observer()
+            return self._send(200, json.dumps({"stopped": True}))
+        if u.path == "/api/watchdog/status":
+            return self._send(200, json.dumps({
+                "running": WATCHDOG_OBSERVER is not None,
+                "drives": list(WATCHDOG_DRIVES),
+                "available": WATCHDOG_AVAILABLE
+            }))
         return self._send(404, "Not found", "text/plain")
 
 def hide_console():
@@ -1324,17 +1807,32 @@ def hide_console():
 
 def main():
     db_init()
+    
+    # Lancer l'observateur watchdog pour la surveillance en temps réel
+    drives = list_drives()
+    global WATCHDOG_OBSERVER
+    
+    if WATCHDOG_AVAILABLE:
+        WATCHDOG_OBSERVER = start_watchdog_observer(drives)
+        if WATCHDOG_OBSERVER:
+            print("✓ watchdog est installé - surveillance en temps réel activée")
+        else:
+            print("⚠ watchdog non disponible - pas de surveillance en temps réel")
+    else:
+        print("⚠ watchdog non installé - pas de surveillance en temps réel")
+        print("  Installez-le avec : pip install watchdog")
+    
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     Handler.server_ref = srv  # expose le serveur au Handler pour /api/shutdown
     url = f"http://127.0.0.1:{PORT}/"
-    print(f"DiskIndexer demarré : {url}")
+    print(f"DiskIndexer démarré : {url}")
     print(f"Base de données : {DB_PATH}")
     hide_console()
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        stop_watchdog_observer()
     print("Arrêt.")
 
 if __name__ == "__main__":

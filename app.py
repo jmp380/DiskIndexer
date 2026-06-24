@@ -21,12 +21,24 @@ import sqlite3
 import string
 import ctypes
 import threading
+import time
 import webbrowser
 import subprocess
 import json
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
+
+# Vérifier si watchdog est disponible
+USE_WATCHDOG = False
+WATCHDOG_ERROR = None
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    USE_WATCHDOG = True
+except ImportError as e:
+    WATCHDOG_ERROR = str(e)
 
 # --- Configuration -----------------------------------------------------------
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "DiskIndexer")
@@ -137,6 +149,7 @@ def index_drives(drives, progress_cb=None):
     batch = []
     BATCH_SIZE = 2000
     total = 0
+    dir_sizes = {}  # Stocke la taille cumulée pour chaque répertoire
 
     def flush():
         nonlocal batch
@@ -148,6 +161,7 @@ def index_drives(drives, progress_cb=None):
             conn.commit()
             batch = []
 
+    # Première passe : indexer tous les fichiers et dossiers
     for drive in drives:
         INDEX_STATE["drive"] = drive
         for root, dirs, files in os.walk(drive, topdown=True, onerror=lambda e: None):
@@ -160,7 +174,9 @@ def index_drives(drives, progress_cb=None):
                     mt = int(os.path.getmtime(full))
                 except OSError:
                     mt = 0
+                # Initialiser la taille du dossier à 0 (sera calculée après)
                 batch.append((drive, full, d, d.lower(), "", 1, 0, mt, root))
+                dir_sizes[full] = 0
                 total += 1
             # Fichiers
             for f in files:
@@ -174,12 +190,22 @@ def index_drives(drives, progress_cb=None):
                     mt = 0
                 ext = os.path.splitext(f)[1].lstrip(".").lower()
                 batch.append((drive, full, f, f.lower(), ext, 0, sz, mt, root))
-                total += 1
+                # Ajouter la taille du fichier au dossier parent
+                parent_dir = root
+                while parent_dir and parent_dir in dir_sizes:
+                    dir_sizes[parent_dir] += sz
+                    parent_dir = os.path.dirname(parent_dir)
                 total += 1
             INDEX_STATE["count"] = total
             if len(batch) >= BATCH_SIZE:
                 flush()
     flush()
+
+    # Deuxième passe : mettre à jour les tailles des dossiers
+    for path, size in dir_sizes.items():
+        c.execute("UPDATE entries SET size = ? WHERE path = ? AND is_dir = 1", (size, path))
+    conn.commit()
+
     conn.close()
     INDEX_STATE.update(running=False, current="Terminé", count=total)
 
@@ -187,6 +213,412 @@ def start_index_async(drives):
     if INDEX_STATE["running"]:
         return False
     t = threading.Thread(target=index_drives, args=(drives,), daemon=True)
+    t.start()
+    return True
+
+# --- Synchronisation incrémentale -------------------------------------------
+SYNC_STATE = {"running": False, "current": "", "added": 0, "removed": 0, "modified": 0}
+
+# --- Surveillance en temps réel -------------------------------------------
+WATCH_STATE = {
+    "running": False,
+    "path": "",
+    "include_subdirs": True,
+    "thread": None,
+    "stop_event": threading.Event(),
+    "observer": None,
+    "last_added": 0
+}
+
+if USE_WATCHDOG:
+    # Utiliser watchdog pour une surveillance optimale
+    class DiskIndexerHandler(FileSystemEventHandler):
+        """Gestionnaire d'événements pour watchdog."""
+        
+        def __init__(self, conn, include_subdirs=True, skip_dirs=None):
+            super().__init__()
+            self.conn = conn
+            self.c = conn.cursor()
+            self.include_subdirs = include_subdirs
+            self.skip_dirs = skip_dirs or SKIP_DIRS
+            self.added_count = 0
+            
+        def norm_path(self, p):
+            return os.path.normpath(p).replace('\\', '/')
+        
+        def is_skipped(self, path):
+            """Vérifie si un chemin doit être ignoré."""
+            parts = self.norm_path(path).split(os.sep)
+            return any(part in self.skip_dirs or part.startswith('$') for part in parts)
+        
+        def on_created(self, event):
+            """Appelé quand un fichier ou dossier est créé."""
+            if event.is_directory:
+                return
+            
+            path = event.src_path
+            if self.is_skipped(path):
+                return
+            
+            try:
+                st = os.stat(path)
+                sz = st.st_size
+                mt = int(st.st_mtime)
+                name = os.path.basename(path)
+                ext = os.path.splitext(name)[1].lstrip(".").lower()
+                parent = os.path.dirname(path)
+                drive = os.path.splitdrive(path)[0] + os.sep if os.name == "nt" else "/"
+                
+                self.c.execute(
+                    "INSERT OR IGNORE INTO entries(drive, path, name, name_lower, ext, is_dir, size, mtime, parent) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (drive, path, name, name.lower(), ext, 0, sz, mt, parent)
+                )
+                self.conn.commit()
+                self.added_count += 1
+                WATCH_STATE["last_added"] = self.added_count
+            except (OSError, sqlite3.Error) as e:
+                print(f"Erreur lors de l'ajout du fichier {path}: {e}")
+        
+        def on_modified(self, event):
+            """Appelé quand un fichier est modifié."""
+            if event.is_directory:
+                return
+            
+            path = event.src_path
+            if self.is_skipped(path):
+                return
+            
+            try:
+                st = os.stat(path)
+                sz = st.st_size
+                mt = int(st.st_mtime)
+                
+                self.c.execute(
+                    "UPDATE entries SET size=?, mtime=? WHERE path=?",
+                    (sz, mt, path)
+                )
+                self.conn.commit()
+            except (OSError, sqlite3.Error) as e:
+                print(f"Erreur lors de la mise à jour du fichier {path}: {e}")
+        
+        def on_deleted(self, event):
+            """Appelé quand un fichier ou dossier est supprimé."""
+            path = event.src_path
+            if self.is_skipped(path):
+                return
+            
+            try:
+                self.c.execute("DELETE FROM entries WHERE path=?", (path,))
+                self.conn.commit()
+            except sqlite3.Error as e:
+                print(f"Erreur lors de la suppression du fichier {path}: {e}")
+    
+    def watch_directory_watchdog(path, include_subdirs=True):
+        """Surveille un répertoire avec watchdog."""
+        WATCH_STATE.update(running=True, path=path, include_subdirs=include_subdirs)
+        conn = db_connect()
+        
+        handler = DiskIndexerHandler(conn, include_subdirs=include_subdirs)
+        observer = Observer()
+        
+        # Configurer l'observateur
+        observer.schedule(handler, path, recursive=include_subdirs)
+        observer.start()
+        
+        WATCH_STATE["observer"] = observer
+        WATCH_STATE["handler"] = handler
+        
+        # Attendre que l'observateur soit arrêté
+        try:
+            while not WATCH_STATE["stop_event"].is_set():
+                time.sleep(1)
+        except Exception as e:
+            print(f"Erreur dans la surveillance: {e}")
+        finally:
+            observer.stop()
+            observer.join()
+            conn.close()
+            WATCH_STATE.update(
+                running=False,
+                path="",
+                thread=None,
+                observer=None,
+                handler=None
+            )
+
+else:
+    # Mode polling (solution de repli si watchdog n'est pas installé)
+    def watch_directory_polling(path, include_subdirs=True, interval=5):
+        """
+        Surveille un répertoire avec polling (solution de repli).
+        """
+        WATCH_STATE.update(running=True, path=path, include_subdirs=include_subdirs)
+        conn = db_connect()
+        c = conn.cursor()
+        
+        # Récupérer les chemins existants dans la base
+        existing_paths = set()
+        rows = c.execute("SELECT path FROM entries").fetchall()
+        existing_paths.update(r[0] for r in rows)
+        
+        def norm_path(p):
+            return os.path.normpath(p).replace('\\', '/')
+        
+        def scan_and_update():
+            nonlocal existing_paths
+            added_count = 0
+            
+            try:
+                if include_subdirs:
+                    # Scanner récursivement
+                    for root, dirs, files in os.walk(path, topdown=True, onerror=lambda e: None):
+                        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith("$")]
+                        
+                        for f in files:
+                            full = os.path.join(root, f)
+                            full_norm = norm_path(full)
+                            
+                            if full_norm not in existing_paths:
+                                try:
+                                    st = os.stat(full)
+                                    sz = st.st_size
+                                    mt = int(st.st_mtime)
+                                    ext = os.path.splitext(f)[1].lstrip(".").lower()
+                                    drive = os.path.splitdrive(full)[0] + os.sep if os.name == "nt" else "/"
+                                    
+                                    c.execute(
+                                        "INSERT OR IGNORE INTO entries(drive, path, name, name_lower, ext, is_dir, size, mtime, parent) VALUES (?,?,?,?,?,?,?,?,?)",
+                                        (drive, full, f, f.lower(), ext, 0, sz, mt, root)
+                                    )
+                                    existing_paths.add(full_norm)
+                                    added_count += 1
+                                except (OSError, sqlite3.Error):
+                                    pass
+                else:
+                    # Scanner uniquement le répertoire (pas de sous-répertoires)
+                    try:
+                        for f in os.listdir(path):
+                            full = os.path.join(path, f)
+                            if os.path.isfile(full):
+                                full_norm = norm_path(full)
+                                
+                                if full_norm not in existing_paths:
+                                    try:
+                                        st = os.stat(full)
+                                        sz = st.st_size
+                                        mt = int(st.st_mtime)
+                                        ext = os.path.splitext(f)[1].lstrip(".").lower()
+                                        drive = os.path.splitdrive(full)[0] + os.sep if os.name == "nt" else "/"
+                                        
+                                        c.execute(
+                                            "INSERT OR IGNORE INTO entries(drive, path, name, name_lower, ext, is_dir, size, mtime, parent) VALUES (?,?,?,?,?,?,?,?,?)",
+                                            (drive, full, f, f.lower(), ext, 0, sz, mt, path)
+                                        )
+                                        existing_paths.add(full_norm)
+                                        added_count += 1
+                                    except (OSError, sqlite3.Error):
+                                        pass
+                    except (OSError, PermissionError):
+                        pass
+                
+                if added_count > 0:
+                    conn.commit()
+                    WATCH_STATE["last_added"] = added_count
+            except Exception as e:
+                print(f"Erreur lors de la surveillance: {e}")
+        
+        # Boucle de surveillance
+        while not WATCH_STATE["stop_event"].is_set():
+            scan_and_update()
+            # Attendre avant le prochain scan
+            for _ in range(interval):
+                if WATCH_STATE["stop_event"].is_set():
+                    break
+                time.sleep(1)
+        
+        conn.close()
+        WATCH_STATE.update(running=False, path="", thread=None)
+    
+    # Alias pour utiliser la bonne fonction selon la disponibilité
+    watch_directory_watchdog = watch_directory_polling
+
+# Fonction unifiée pour démarrer la surveillance
+def watch_directory(path, include_subdirs=True):
+    """Démarre la surveillance avec watchdog ou polling selon la disponibilité."""
+    if USE_WATCHDOG:
+        watch_directory_watchdog(path, include_subdirs)
+    else:
+        watch_directory_polling(path, include_subdirs)
+
+def start_watch(path, include_subdirs=True):
+    """Démarre la surveillance d'un répertoire."""
+    if WATCH_STATE["running"]:
+        stop_watch()
+    
+    if not path or not os.path.isdir(path):
+        return False
+    
+    WATCH_STATE["stop_event"].clear()
+    WATCH_STATE["path"] = path
+    WATCH_STATE["include_subdirs"] = include_subdirs
+    WATCH_STATE["last_added"] = 0
+    
+    t = threading.Thread(
+        target=watch_directory,
+        args=(path, include_subdirs),
+        daemon=True
+    )
+    t.start()
+    WATCH_STATE["thread"] = t
+    return True
+
+def stop_watch():
+    """Arrête la surveillance en cours."""
+    if WATCH_STATE["running"]:
+        WATCH_STATE["stop_event"].set()
+        if USE_WATCHDOG and WATCH_STATE["observer"]:
+            WATCH_STATE["observer"].stop()
+        if WATCH_STATE["thread"]:
+            WATCH_STATE["thread"].join(timeout=2)
+    return True
+
+def sync_drives(drives, progress_cb=None):
+    """Synchronisation incrémentale : détecte les changements et met à jour la base."""
+    SYNC_STATE.update(running=True, current="", added=0, removed=0, modified=0)
+    conn = db_connect()
+    c = conn.cursor()
+    
+    batch_insert = []
+    batch_update = []
+    batch_delete = []
+    BATCH_SIZE = 2000
+    
+    # Normaliser les chemins pour la comparaison
+    def norm_path(p):
+        return os.path.normpath(p).replace('\\', '/')
+    
+    def flush():
+        nonlocal batch_insert, batch_update, batch_delete
+        if batch_insert:
+            c.executemany(
+                "INSERT OR IGNORE INTO entries(drive, path, name, name_lower, ext, is_dir, size, mtime, parent) VALUES (?,?,?,?,?,?,?,?,?)",
+                batch_insert,
+            )
+            conn.commit()
+            batch_insert = []
+        if batch_update:
+            c.executemany(
+                "UPDATE entries SET size=?, mtime=? WHERE path=?",
+                batch_update,
+            )
+            conn.commit()
+            batch_update = []
+        if batch_delete:
+            c.executemany(
+                "DELETE FROM entries WHERE path=?",
+                batch_delete,
+            )
+            conn.commit()
+            batch_delete = []
+    
+    # Récupérer tous les chemins existants dans la base pour ces disques
+    existing_paths = set()
+    if drives:
+        for d in drives:
+            rows = c.execute("SELECT path FROM entries WHERE drive = ?", (d,)).fetchall()
+            existing_paths.update(norm_path(r[0]) for r in rows)
+    else:
+        rows = c.execute("SELECT path FROM entries").fetchall()
+        existing_paths.update(norm_path(r[0]) for r in rows)
+    
+    # Scanner les disques pour détecter les changements
+    current_paths = set()
+    dir_sizes = {}  # Pour recalculer les tailles des dossiers
+    
+    for drive in (drives if drives else list_drives()):
+        SYNC_STATE["current"] = f"Scanne {drive}"
+        for root, dirs, files in os.walk(drive, topdown=True, onerror=lambda e: None):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith("$")]
+            
+            # Dossiers
+            for d in dirs:
+                full = os.path.join(root, d)
+                full_norm = norm_path(full)
+                current_paths.add(full_norm)
+                dir_sizes[full_norm] = 0
+                
+                # Vérifier si le dossier existe dans la base
+                if full_norm not in existing_paths:
+                    # Nouveau dossier
+                    try:
+                        mt = int(os.path.getmtime(full))
+                    except OSError:
+                        mt = 0
+                    batch_insert.append((drive, full, d, d.lower(), "", 1, 0, mt, root))
+                    SYNC_STATE["added"] += 1
+                
+            # Fichiers
+            for f in files:
+                full = os.path.join(root, f)
+                full_norm = norm_path(full)
+                current_paths.add(full_norm)
+                
+                try:
+                    st = os.stat(full)
+                    sz = st.st_size
+                    mt = int(st.st_mtime)
+                except OSError:
+                    sz = 0
+                    mt = 0
+                
+                ext = os.path.splitext(f)[1].lstrip(".").lower()
+                
+                # Ajouter la taille au dossier parent
+                parent_dir = norm_path(root)
+                while parent_dir and parent_dir in dir_sizes:
+                    dir_sizes[parent_dir] += sz
+                    parent_dir = norm_path(os.path.dirname(parent_dir))
+                
+                if full_norm not in existing_paths:
+                    # Nouveau fichier
+                    batch_insert.append((drive, full, f, f.lower(), ext, 0, sz, mt, root))
+                    SYNC_STATE["added"] += 1
+                else:
+                    # Vérifier si le fichier a été modifié
+                    db_entry = c.execute("SELECT size, mtime FROM entries WHERE path = ?", (full,)).fetchone()
+                    if db_entry and (db_entry[0] != sz or db_entry[1] != mt):
+                        # Fichier modifié
+                        batch_update.append((sz, mt, full))
+                        SYNC_STATE["modified"] += 1
+            
+            if len(batch_insert) >= BATCH_SIZE or len(batch_update) >= BATCH_SIZE:
+                flush()
+    
+    # Détecter les fichiers/dossiers supprimés
+    for path in existing_paths - current_paths:
+        # Trouver le chemin original dans la base
+        basename = os.path.basename(path)
+        original_path = c.execute("SELECT path FROM entries WHERE path LIKE ? LIMIT 1", (f"%{basename}",)).fetchone()
+        if original_path:
+            batch_delete.append((original_path[0],))
+            SYNC_STATE["removed"] += 1
+        if len(batch_delete) >= BATCH_SIZE:
+            flush()
+    
+    flush()
+    
+    # Mettre à jour les tailles des dossiers
+    for path, size in dir_sizes.items():
+        c.execute("UPDATE entries SET size = ? WHERE path = ? AND is_dir = 1", (size, path))
+    conn.commit()
+    
+    conn.close()
+    SYNC_STATE.update(running=False, current="Terminé")
+
+def start_sync_async(drives=None):
+    if SYNC_STATE["running"] or INDEX_STATE["running"]:
+        return False
+    t = threading.Thread(target=sync_drives, args=(drives,), daemon=True)
     t.start()
     return True
 
@@ -516,7 +948,7 @@ def search(q, use_regex, drives, include_subdirs, dirs_only, files_only,
     rows = rows[:1000]
     results = [{
         "path": r[0], "name": r[1], "is_dir": bool(r[2]),
-        "size": r[3], "size_h": human_size(r[3]) if not r[2] else "",
+        "size": r[3], "size_h": human_size(r[3]),
         "parent": r[4], "drive": r[5],
         "mtime": r[6] or 0,
     } for r in rows]
@@ -695,9 +1127,27 @@ INDEX_HTML = r"""<!doctype html>
     <div class="opts" style="margin-top:12px">
       <label><input type="checkbox" id="opt-subdirs-idx" checked> Inclure les sous-répertoires</label>
     </div>
+    
+    <!-- Surveillance en temps réel -->
+    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+      <div class="field-label" style="margin-bottom:8px">🔄 Surveillance en temps réel</div>
+      <div class="row" style="gap:8px;align-items:center">
+        <input id="watch-dir" type="text" placeholder="Chemin du répertoire à surveiller"
+               style="flex:1" title="Ex: D:\\Projets ou /home/user/documents"/>
+        <label style="color:var(--text);white-space:nowrap">
+          <input type="checkbox" id="watch-subdirs" checked> Sous-répertoires
+        </label>
+        <button id="btn-watch-toggle" class="secondary">Démarrer</button>
+      </div>
+      <div class="hint" style="margin-top:4px">
+        Les nouveaux fichiers seront automatiquement ajoutés à l'index
+      </div>
+      <div id="watch-status" class="status" style="margin-top:8px"></div>
+    </div>
+    
     <div class="row" style="margin-top:14px">
       <button id="btn-index">Lancer l'indexation</button>
-      <button id="btn-refresh" class="secondary">Actualiser état</button>
+      <button id="btn-refresh" class="secondary">Synchroniser</button>
       <div class="status" id="status"></div>
     </div>
   </section>
@@ -770,10 +1220,34 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
 
+    <!-- Filtre rapide par date de modification -->
+    <div class="field" style="margin-bottom:12px">
+      <div class="field-label">📅 Filtrer par date de modification</div>
+      <div class="grid3">
+        <div class="field">
+          <input id="f-dmin-quick" type="text" placeholder="JJ/MM/AAAA (après)" title="Modifié après cette date"/>
+        </div>
+        <div class="field">
+          <input id="f-dmax-quick" type="text" placeholder="JJ/MM/AAAA (avant)" title="Modifié avant cette date"/>
+        </div>
+        <div class="field">
+          <select id="f-date-preset" style="padding:10px 14px;background:var(--input-bg);color:var(--text);
+                  border:1px solid var(--border);border-radius:8px;font-size:14px;width:100%">
+            <option value="">Prédéfini...</option>
+            <option value="today">Aujourd'hui</option>
+            <option value="yesterday">Hier</option>
+            <option value="week">7 derniers jours</option>
+            <option value="month">30 derniers jours</option>
+            <option value="year">12 derniers mois</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
     <!-- Options de base -->
     <div class="opts">
       <label><input type="checkbox" id="opt-sizes" checked> Afficher les tailles</label>
-      <label><input type="checkbox" id="opt-dates" checked> Afficher les dates</label>
+      <label><input type="checkbox" id="opt-mtime" checked> Afficher modifié le</label>
       <label><input type="checkbox" id="opt-dirs-only"> Dossiers uniquement</label>
       <label><input type="checkbox" id="opt-files-only"> Fichiers uniquement</label>
       <label><input type="checkbox" id="opt-subdirs" checked> Inclure les sous-répertoires</label>
@@ -856,24 +1330,6 @@ function onExtInput(){
   });
 }
 
-document.querySelectorAll('.ftype-chip').forEach(chip=>{
-  chip.addEventListener('click', ()=>{
-    if(chip.dataset.exts === ''){
-      // "Tous" → désélectionner tout le reste
-      document.querySelectorAll('.ftype-chip').forEach(c=>c.classList.remove('on'));
-      chip.classList.add('on');
-    } else {
-      // Désactiver "Tous"
-      document.querySelector('.ftype-chip[data-exts=""]').classList.remove('on');
-      chip.classList.toggle('on');
-      // Si plus rien de sélectionné → remettre "Tous"
-      if(!document.querySelector('.ftype-chip.on')){
-        document.querySelector('.ftype-chip[data-exts=""]').classList.add('on');
-      }
-    }
-  });
-});
-
 // --- Disques -----------------------------------------------------------------
 function toggleAdvanced(){
   const p = document.getElementById('advanced-panel');
@@ -912,15 +1368,112 @@ async function loadDrives(){
 async function refreshStatus(){
   const r = await fetch('/api/status'); const j = await r.json();
   const s = document.getElementById('status');
+  
+  // Vérifier si une indexation est en cours
   if(j.running){
     s.textContent = `Indexation ${j.drive} — ${j.count.toLocaleString()} entrées — ${j.current}`;
     document.getElementById('btn-index').disabled = true;
     setTimeout(refreshStatus, 1000);
   } else {
-    s.textContent = j.count ? `Prêt. Dernière indexation : ${j.count.toLocaleString()} entrées.` : 'Prêt.';
-    document.getElementById('btn-index').disabled = false;
+    // Vérifier si une synchronisation est en cours
+    const sync = j.sync || {};
+    if(sync.running){
+      let syncMsg = `Synchronisation`;
+      if(sync.current) syncMsg += ` ${sync.current}`;
+      if(sync.added > 0) syncMsg += ` — +${sync.added}`;
+      if(sync.removed > 0) syncMsg += ` — -${sync.removed}`;
+      if(sync.modified > 0) syncMsg += ` — ~${sync.modified}`;
+      s.textContent = syncMsg;
+      document.getElementById('btn-index').disabled = true;
+      setTimeout(refreshStatus, 1000);
+    } else {
+      s.textContent = j.count ? `Prêt. Dernière indexation : ${j.count.toLocaleString()} entrées.` : 'Prêt.';
+      document.getElementById('btn-index').disabled = false;
+    }
   }
 }
+
+async function startSync(){
+  // Utiliser les disques sélectionnés pour la recherche (ou tous si aucun sélectionné)
+  const drives = SELECTED_SEARCH.size > 0 ? [...SELECTED_SEARCH] : [...SELECTED_IDX];
+  if(drives.length === 0 && DRIVES.length === 0){
+    alert('Aucun disque disponible pour la synchronisation.');
+    return;
+  }
+  
+  // Si aucun disque n'est sélectionné, utiliser tous les disques
+  const drivesToSync = drives.length > 0 ? drives : [...DRIVES];
+  
+  const params = new URLSearchParams({ drives: drivesToSync.join('|') });
+  const r = await fetch('/api/sync?' + params);
+  const j = await r.json();
+  
+  if(j.started){
+    document.getElementById('status').textContent = 'Synchronisation démarrée...';
+    setTimeout(refreshStatus, 500);
+  } else {
+    document.getElementById('status').textContent = 'Synchronisation déjà en cours ou indexation active.';
+  }
+}
+
+// --- Surveillance en temps réel -------------------------------------------
+async function toggleWatch(){
+  const pathInput = document.getElementById('watch-dir');
+  const includeSubdirs = document.getElementById('watch-subdirs').checked;
+  const btn = document.getElementById('btn-watch-toggle');
+  const statusEl = document.getElementById('watch-status');
+  
+  if(btn.textContent.includes('Arrêter')){
+    // Arrêter la surveillance
+    const r = await fetch('/api/watch/stop');
+    const j = await r.json();
+    if(j.stopped){
+      btn.textContent = 'Démarrer';
+      statusEl.textContent = 'Surveillance arrêtée.';
+    }
+  } else {
+    // Démarrer la surveillance
+    const path = pathInput.value.trim();
+    if(!path){
+      alert('Veuillez spécifier un répertoire à surveiller.');
+      return;
+    }
+    
+    const params = new URLSearchParams({
+      path: path,
+      subdirs: includeSubdirs ? '1' : '0'
+    });
+    
+    const r = await fetch('/api/watch/start?' + params);
+    const j = await r.json();
+    
+    if(j.started){
+      btn.textContent = 'Arrêter';
+      statusEl.textContent = `Surveillance de ${path} en cours...`;
+      
+      // Vérifier périodiquement le statut
+      const checkWatchStatus = async () => {
+        const r = await fetch('/api/watch/status');
+        const w = await r.json();
+        if(w.running && w.last_added > 0){
+          statusEl.textContent = `Surveillance de ${path} — +${w.last_added} fichiers ajoutés`;
+        }
+        if(w.running){
+          setTimeout(checkWatchStatus, 2000);
+        } else {
+          btn.textContent = 'Démarrer';
+          statusEl.textContent = 'Surveillance arrêtée.';
+        }
+      };
+      setTimeout(checkWatchStatus, 2000);
+    } else {
+      alert('Impossible de démarrer la surveillance. Vérifiez que le chemin est valide.');
+    }
+  }
+}
+
+// Initialiser le bouton de surveillance
+document.getElementById('btn-watch-toggle').onclick = toggleWatch;
 
 // Toggle regex hint
 document.getElementById('opt-regex').addEventListener('change', function(){
@@ -942,7 +1495,7 @@ document.getElementById('btn-reset').onclick = ()=>{
   document.getElementById('q').value='';
   document.getElementById('opt-regex').checked=false;
   document.getElementById('opt-sizes').checked=true;
-  document.getElementById('opt-dates').checked=true;
+  document.getElementById('opt-mtime').checked=true;
   document.getElementById('opt-dirs-only').checked=false;
   document.getElementById('opt-files-only').checked=false;
   document.getElementById('opt-subdirs').checked=true;
@@ -952,6 +1505,9 @@ document.getElementById('btn-reset').onclick = ()=>{
   document.getElementById('f-path').value='';
   document.getElementById('f-dmin').value='';
   document.getElementById('f-dmax').value='';
+  document.getElementById('f-dmin-quick').value='';
+  document.getElementById('f-dmax-quick').value='';
+  document.getElementById('f-date-preset').value='';
   document.getElementById('f-sort').value='name';
   document.getElementById('regex-hint').style.display='none';
   document.getElementById('text-hint').style.display='block';
@@ -970,13 +1526,87 @@ document.getElementById('btn-reset').onclick = ()=>{
   document.querySelectorAll('#search-drives .sdrive-chip').forEach(b=>b.classList.add('on'));
 };
 
+// Synchronisation des champs de date rapide avec les champs avancés
+function syncDateFields(){
+  const dminQuick = document.getElementById('f-dmin-quick').value;
+  const dmaxQuick = document.getElementById('f-dmax-quick').value;
+  const dminAdv = document.getElementById('f-dmin').value;
+  const dmaxAdv = document.getElementById('f-dmax').value;
+  
+  // Si les champs rapides sont remplis, les copier vers les champs avancés
+  if(dminQuick || dmaxQuick){
+    if(!dminAdv) document.getElementById('f-dmin').value = dminQuick;
+    if(!dmaxAdv) document.getElementById('f-dmax').value = dmaxQuick;
+  }
+}
+
+// Gestion des prédéfini de date
+document.getElementById('f-date-preset').addEventListener('change', function(){
+  const preset = this.value;
+  const today = new Date();
+  const dmin = document.getElementById('f-dmin-quick');
+  const dmax = document.getElementById('f-dmax-quick');
+  
+  if(!preset) return;
+  
+  const pad = n => String(n).padStart(2,'0');
+  const todayStr = `${pad(today.getDate())}/${pad(today.getMonth()+1)}/${today.getFullYear()}`;
+  
+  switch(preset){
+    case 'today':
+      dmin.value = todayStr;
+      dmax.value = todayStr;
+      break;
+    case 'yesterday':
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      dmin.value = `${pad(yesterday.getDate())}/${pad(yesterday.getMonth()+1)}/${yesterday.getFullYear()}`;
+      dmax.value = `${pad(yesterday.getDate())}/${pad(yesterday.getMonth()+1)}/${yesterday.getFullYear()}`;
+      break;
+    case 'week':
+      const weekAgo = new Date(today);
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      dmin.value = `${pad(weekAgo.getDate())}/${pad(weekAgo.getMonth()+1)}/${weekAgo.getFullYear()}`;
+      dmax.value = todayStr;
+      break;
+    case 'month':
+      const monthAgo = new Date(today);
+      monthAgo.setDate(monthAgo.getDate() - 30);
+      dmin.value = `${pad(monthAgo.getDate())}/${pad(monthAgo.getMonth()+1)}/${monthAgo.getFullYear()}`;
+      dmax.value = todayStr;
+      break;
+    case 'year':
+      const yearAgo = new Date(today);
+      yearAgo.setDate(yearAgo.getDate() - 365);
+      dmin.value = `${pad(yearAgo.getDate())}/${pad(yearAgo.getMonth()+1)}/${yearAgo.getFullYear()}`;
+      dmax.value = todayStr;
+      break;
+  }
+  
+  // Réinitialiser le sélecteur
+  this.value = '';
+});
+
+// Synchroniser avant la recherche
+document.getElementById('btn-search').onclick = ()=>{
+  syncDateFields();
+  doSearch();
+};
+
+document.getElementById('q').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){
+    syncDateFields();
+    doSearch();
+  }
+});
+
 document.getElementById('btn-index').onclick = async ()=>{
   if(SELECTED_IDX.size===0){alert('Sélectionnez au moins un disque.');return;}
   const body = { drives:[...SELECTED_IDX] };
   await fetch('/api/index',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   refreshStatus();
 };
-document.getElementById('btn-refresh').onclick = refreshStatus;
+document.getElementById('btn-refresh').onclick = startSync;
 
 async function doSearch(){
   const q = document.getElementById('q').value.trim();
@@ -1009,7 +1639,7 @@ async function doSearch(){
   const r = await fetch('/api/search?'+params);
   const j = await r.json();
   const showSize = document.getElementById('opt-sizes').checked;
-  const showDate = document.getElementById('opt-dates').checked;
+  const showMtime = document.getElementById('opt-mtime').checked;
 
   if(j.error){
     document.getElementById('error-box').textContent='⚠ ' + j.error;
@@ -1023,6 +1653,17 @@ async function doSearch(){
   if(SELECTED_SEARCH.size < DRIVES.length)
     filterSummary.push(`disques: ${[...SELECTED_SEARCH].join(' ')}`);
   if(exts.length) filterSummary.push(`types: .${exts.join(' .')}`);
+  
+  // Ajouter le filtre par date si actif
+  const dmin = document.getElementById('f-dmin').value.trim();
+  const dmax = document.getElementById('f-dmax').value.trim();
+  if(dmin || dmax){
+    const dateFilter = [];
+    if(dmin) dateFilter.push(`après ${dmin}`);
+    if(dmax) dateFilter.push(`avant ${dmax}`);
+    filterSummary.push(`date: ${dateFilter.join(' et ')}`);
+  }
+  
   const summary = filterSummary.length ? ` [${filterSummary.join(' | ')}]` : '';
 
   document.getElementById('meta').textContent =
@@ -1036,14 +1677,14 @@ async function doSearch(){
   }
 
   // Avertissement si aucune date disponible (base indexée avant la mise à jour)
-  if(showDate && j.results.length > 0 && j.results.every(r => !r.mtime)){
+  if(showMtime && j.results.length > 0 && j.results.every(r => !r.mtime)){
     document.getElementById('meta').textContent +=
-      ' ⚠ Dates non disponibles — relancez une indexation.';
+      ' ⚠ Dates de modification non disponibles — relancez une indexation.';
   }
 
   const rows = j.results.map(it=>{
     const sz   = showSize ? `<td>${it.size_h}</td>` : '';
-    const dt   = showDate ? `<td style="white-space:nowrap;font-size:12px;color:var(--muted)">${fmtDate(it.mtime)}</td>` : '';
+    const dt   = showMtime ? `<td style="white-space:nowrap;font-size:12px;color:var(--muted)">${fmtDate(it.mtime)}</td>` : '';
     const tag  = it.is_dir ? '<span class="tag dir">DOSSIER</span>' : '<span class="tag file">FICHIER</span>';
     const openHref   = '/open?path='  +encodeURIComponent(it.path);
     const revealHref = '/reveal?path='+encodeURIComponent(it.path);
@@ -1057,7 +1698,7 @@ async function doSearch(){
   const szTh = showSize ? '<th>Taille</th>' : '';
   const currentSort = document.getElementById('f-sort').value;
   const dtArrow = currentSort === 'date_desc' ? ' ▼' : currentSort === 'date_asc' ? ' ▲' : '';
-  const dtTh = showDate
+  const dtTh = showMtime
     ? `<th style="cursor:pointer;user-select:none" title="Cliquer pour trier" onclick="cycleSort()">`
       + `Modifié le${dtArrow}</th>`
     : '';
@@ -1076,8 +1717,7 @@ function cycleSort(){
 
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
-document.getElementById('btn-search').onclick = doSearch;
-document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+
 
 // --- Thèmes ------------------------------------------------------------------
 const THEMES = ['default','slate','forest','bordeaux','light','sepia'];
@@ -1110,6 +1750,26 @@ document.getElementById('btn-quit').onclick = async ()=>{
 };
 
 loadDrives(); refreshStatus();
+
+// Initialiser les écouteurs des chips de types de fichiers après le chargement
+// (pour s'assurer que le DOM est prêt)
+document.querySelectorAll('.ftype-chip').forEach(chip=>{
+  chip.addEventListener('click', ()=>{
+    if(chip.dataset.exts === ''){
+      // "Tous" → désélectionner tout le reste
+      document.querySelectorAll('.ftype-chip').forEach(c=>c.classList.remove('on'));
+      chip.classList.add('on');
+    } else {
+      // Désactiver "Tous"
+      document.querySelector('.ftype-chip[data-exts=""]').classList.remove('on');
+      chip.classList.toggle('on');
+      // Si plus rien de sélectionné → remettre "Tous"
+      if(!document.querySelector('.ftype-chip.on')){
+        document.querySelector('.ftype-chip[data-exts=""]').classList.add('on');
+      }
+    }
+  });
+});
 </script>
 </body></html>
 """
@@ -1136,8 +1796,26 @@ class Handler(BaseHTTPRequestHandler):
             conn = db_connect()
             count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
             conn.close()
-            st = dict(INDEX_STATE); st["count"] = st["count"] if st["running"] else count
+            st = dict(INDEX_STATE)
+            st["count"] = st["count"] if st["running"] else count
+            st["sync"] = SYNC_STATE
             return self._send(200, json.dumps(st))
+        if u.path == "/api/sync":
+            drives = parse_qs(u.query).get("drives", [])
+            drives_list = [d for d in (drives[0].split("|") if drives else []) if d]
+            started = start_sync_async(drives_list if drives_list else None)
+            return self._send(200, json.dumps({"started": started}))
+        if u.path == "/api/watch/start":
+            qs = parse_qs(u.query)
+            path = qs.get("path", [""])[0]
+            include_subdirs = qs.get("subdirs", ["1"])[0] == "1"
+            started = start_watch(path, include_subdirs)
+            return self._send(200, json.dumps({"started": started, "watching": WATCH_STATE["path"]}))
+        if u.path == "/api/watch/stop":
+            stopped = stop_watch()
+            return self._send(200, json.dumps({"stopped": stopped}))
+        if u.path == "/api/watch/status":
+            return self._send(200, json.dumps(WATCH_STATE))
         if u.path == "/api/search":
             qs = parse_qs(u.query)
             q         = (qs.get("q", [""])[0] or "").strip()
@@ -1199,6 +1877,16 @@ def hide_console():
 
 def main():
     db_init()
+    
+    # Afficher l'état de watchdog
+    if USE_WATCHDOG:
+        print("✓ watchdog est installé - surveillance en temps réel optimisée")
+    else:
+        print("⚠ watchdog n'est pas installé - utilisation du mode polling (moins efficace)")
+        print("  Pour installer watchdog: pip install watchdog")
+        if WATCHDOG_ERROR:
+            print(f"  Erreur: {WATCHDOG_ERROR}")
+    
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     Handler.server_ref = srv  # expose le serveur au Handler pour /api/shutdown
     url = f"http://127.0.0.1:{PORT}/"
